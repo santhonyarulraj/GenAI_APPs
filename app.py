@@ -1,84 +1,150 @@
-import streamlit as st
-import os
+import os, json
+from openai import OpenAI
+from neo4j import GraphDatabase
 from dotenv import load_dotenv
 
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from langchain.docstore.document import Document
-
-# Load environment variables
 load_dotenv()
+ai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+db = GraphDatabase.driver(os.getenv("NEO4J_URI"), auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD")))
+#from neo4j import GraphDatabase
 
-# Get API key
-openai_api_key = os.getenv("OPENAI_API_KEY")
+# driver = GraphDatabase.driver(
+#     "bolt://localhost:7687",
+#     auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
+# )
 
-if not openai_api_key:
-    st.error("OPENAI_API_KEY not found in .env file")
-    st.stop()
+# ─────────────────────────────────────────────
+# STEP 1: Load Document
+# ─────────────────────────────────────────────
+def load_faq(path="faq.txt"):
+    with open(path) as f:
+        text = f.read()
+    # Split into chunks by Q&A pairs
+    chunks = [c.strip() for c in text.split("\n\n") if c.strip()]
+    print(f"📄 Loaded {len(chunks)} chunks")
+    return chunks
 
-st.title("🏠 House Rental FAQ - RAG App")
+# ─────────────────────────────────────────────
+# STEP 2: Extract Entities & Relations (LLM)
+# ─────────────────────────────────────────────
+def extract(chunk):
+    prompt = f"""Extract entities and relations from this text.
+Return ONLY valid JSON like:
+{{"entities": [{{"name": "AI", "type": "CONCEPT"}}], "relations": [{{"source": "ML", "relation": "SUBSET_OF", "target": "AI"}}]}}
 
-uploaded_file = st.file_uploader("Upload FAQ .txt file", type="txt")
+Text: {chunk}"""
 
-if uploaded_file:
-
-    text = uploaded_file.read().decode("utf-8")
-
-    # Split text
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
-
-    chunks = text_splitter.split_text(text)
-    documents = [Document(page_content=chunk) for chunk in chunks]
-
-    # Create embeddings
-    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-
-    # Create vector store
-    vectorstore = Chroma.from_documents(documents, embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-
-    # Strict Prompt
-    prompt_template = """
-You are a helpful assistant answering ONLY from the provided FAQ document.
-
-If the answer is not found in the FAQ document, respond exactly with:
-"Information not present in the FAQ document."
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-
-    PROMPT = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"]
-    )
-
-    llm = ChatOpenAI(
+    res = ai.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0,
-        openai_api_key=openai_api_key
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
     )
+    text = res.choices[0].message.content.strip()
+    # Clean markdown code blocks
+    if "```" in text:
+        text = text.split("```")[1].removeprefix("json").strip()
+    try:
+        return json.loads(text)
+    except:
+        return {"entities": [], "relations": []}
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        chain_type_kwargs={"prompt": PROMPT}
+# ─────────────────────────────────────────────
+# STEP 3: Store in Neo4j
+# ─────────────────────────────────────────────
+def store(entities, relations):
+    with db.session() as s:
+        s.run("MATCH (n) DETACH DELETE n")  # Clear old data
+        for e in entities:
+            s.run("MERGE (n:Entity {name: $name}) SET n.type = $type", name=e["name"], type=e["type"])
+        for r in relations:
+            s.run("""
+                MATCH (a:Entity {name: $src}), (b:Entity {name: $tgt})
+                MERGE (a)-[:RELATES {type: $rel}]->(b)
+            """, src=r["source"], rel=r["relation"], tgt=r["target"])
+    print(f"💾 Stored {len(entities)} entities, {len(relations)} relations")
+
+# ─────────────────────────────────────────────
+# STEP 4: Query (RAG)
+# ─────────────────────────────────────────────
+def search_graph(question):
+    # Ask LLM to extract keywords
+    res = ai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": f'Extract keywords from this question as a JSON array: "{question}"'}],
+        temperature=0
     )
+    text = res.choices[0].message.content.strip()
+    if "```" in text:
+        text = text.split("```")[1].removeprefix("json").strip()
+    keywords = json.loads(text)
 
-    user_query = st.text_input("Ask your question about the house:")
+    # Search Neo4j for matching entities + their connections
+    results = []
+    with db.session() as s:
+        for kw in keywords:
+            records = s.run("""
+                MATCH (n:Entity) WHERE toLower(n.name) CONTAINS toLower($kw)
+                OPTIONAL MATCH (n)-[r:RELATES]->(m)
+                OPTIONAL MATCH (p)-[r2:RELATES]->(n)
+                RETURN n.name AS entity, n.type AS type,
+                       collect(DISTINCT {rel: r.type, target: m.name}) AS out,
+                       collect(DISTINCT {rel: r2.type, source: p.name}) AS inc
+            """, kw=kw)
+            for rec in records:
+                d = rec.data()
+                info = f"{d['entity']} ({d['type']})"
+                for o in d['out']:
+                    if o['target']: info += f"\n  → {d['entity']} --{o['rel']}--> {o['target']}"
+                for i in d['inc']:
+                    if i['source']: info += f"\n  ← {i['source']} --{i['rel']}--> {d['entity']}"
+                results.append(info)
+    return "\n\n".join(results) if results else "No info found."
 
-    if user_query:
-        response = qa_chain.run(user_query)
-        st.write("### Answer:")
-        st.write(response)
+def ask(question):
+    context = search_graph(question)
+    res = ai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Answer based ONLY on this Knowledge Graph context. Be concise."},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}
+        ],
+        temperature=0.3
+    )
+    return res.choices[0].message.content
+
+# ─────────────────────────────────────────────
+# RUN THE PIPELINE
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    # === BUILD PHASE ===
+    print("🚀 Building Knowledge Graph...\n")
+    chunks = load_faq()
+
+    all_entities, all_relations = [], []
+    seen_e, seen_r = set(), set()
+
+    for i, chunk in enumerate(chunks):
+        print(f"  🧠 Extracting chunk {i+1}/{len(chunks)}...")
+        data = extract(chunk)
+        for e in data["entities"]:
+            if e["name"] not in seen_e:
+                seen_e.add(e["name"])
+                all_entities.append(e)
+        for r in data["relations"]:
+            key = (r["source"], r["relation"], r["target"])
+            if key not in seen_r:
+                seen_r.add(key)
+                all_relations.append(r)
+
+    store(all_entities, all_relations)
+    print("✅ Knowledge Graph ready!\n")
+
+    # === QUERY PHASE ===
+    print("💬 Ask anything! (type 'quit' to exit)\n")
+    while True:
+        q = input("❓ Question: ").strip()
+        if q.lower() in ["quit", "exit", "q"]: break
+        if q:
+            print(f"\n💡 {ask(q)}\n")
+
+    db.close()
